@@ -488,7 +488,9 @@ fn parse_setting(
             .dual_list_sibling
             .clone()
             .or_else(|| resolved.dual_list_sibling.clone()),
-        dynamically_extendable_status_bar_elements: schema.dynamically_extendable_status_bar_elements || resolved.dynamically_extendable_status_bar_elements,
+        dynamically_extendable_status_bar_elements: schema
+            .dynamically_extendable_status_bar_elements
+            || resolved.dynamically_extendable_status_bar_elements,
     }
 }
 
