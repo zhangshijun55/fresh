@@ -4,55 +4,55 @@
     "cmd.goto_line_with_selection_desc": "Select from current position to target line"
   },
   "cs": {
-    "cmd.goto_line_with_selection": "Go to Line with Selection",
-    "cmd.goto_line_with_selection_desc": "Select from current position to target line"
+    "cmd.goto_line_with_selection": "Jít na řádek s výběrem",
+    "cmd.goto_line_with_selection_desc": "Vybrat od aktuální pozice po cílový řádek"
   },
   "de": {
-    "cmd.goto_line_with_selection": "Go to Line with Selection",
-    "cmd.goto_line_with_selection_desc": "Select from current position to target line"
+    "cmd.goto_line_with_selection": "Zur Zeile mit Auswahl",
+    "cmd.goto_line_with_selection_desc": "Von der aktuellen Position zur Zielzeile auswählen"
   },
   "es": {
-    "cmd.goto_line_with_selection": "Go to Line with Selection",
-    "cmd.goto_line_with_selection_desc": "Select from current position to target line"
+    "cmd.goto_line_with_selection": "Ir a línea con selección",
+    "cmd.goto_line_with_selection_desc": "Seleccionar desde la posición actual hasta la línea destino"
   },
   "fr": {
-    "cmd.goto_line_with_selection": "Go to Line with Selection",
-    "cmd.goto_line_with_selection_desc": "Select from current position to target line"
+    "cmd.goto_line_with_selection": "Aller à la ligne avec sélection",
+    "cmd.goto_line_with_selection_desc": "Sélectionner de la position actuelle jusqu'à la ligne cible"
   },
   "it": {
-    "cmd.goto_line_with_selection": "Go to Line with Selection",
-    "cmd.goto_line_with_selection_desc": "Select from current position to target line"
+    "cmd.goto_line_with_selection": "Vai alla riga con selezione",
+    "cmd.goto_line_with_selection_desc": "Seleziona dalla posizione attuale alla riga di destinazione"
   },
   "ja": {
-    "cmd.goto_line_with_selection": "Go to Line with Selection",
-    "cmd.goto_line_with_selection_desc": "Select from current position to target line"
+    "cmd.goto_line_with_selection": "選択付きで移動先へ",
+    "cmd.goto_line_with_selection_desc": "現在位置から移動先行まで選択"
   },
   "ko": {
-    "cmd.goto_line_with_selection": "Go to Line with Selection",
-    "cmd.goto_line_with_selection_desc": "Select from current position to target line"
+    "cmd.goto_line_with_selection": "선택 포함 줄로 이동",
+    "cmd.goto_line_with_selection_desc": "현재 위치에서 대상 줄까지 선택"
   },
   "pt-BR": {
-    "cmd.goto_line_with_selection": "Go to Line with Selection",
-    "cmd.goto_line_with_selection_desc": "Select from current position to target line"
+    "cmd.goto_line_with_selection": "Ir para linha com seleção",
+    "cmd.goto_line_with_selection_desc": "Selecionar da posição atual até a linha de destino"
   },
   "ru": {
-    "cmd.goto_line_with_selection": "Go to Line with Selection",
-    "cmd.goto_line_with_selection_desc": "Select from current position to target line"
+    "cmd.goto_line_with_selection": "Перейти к строке с выделением",
+    "cmd.goto_line_with_selection_desc": "Выделить от текущей позиции до целевой строки"
   },
   "th": {
-    "cmd.goto_line_with_selection": "Go to Line with Selection",
-    "cmd.goto_line_with_selection_desc": "Select from current position to target line"
+    "cmd.goto_line_with_selection": "ไปยังบรรทัดพร้อมการเลือก",
+    "cmd.goto_line_with_selection_desc": "เลือกจากตำแหน่งปัจจุบันไปยังบรรทัดเป้าหมาย"
   },
   "uk": {
-    "cmd.goto_line_with_selection": "Go to Line with Selection",
-    "cmd.goto_line_with_selection_desc": "Select from current position to target line"
+    "cmd.goto_line_with_selection": "Перейти до рядка з виділенням",
+    "cmd.goto_line_with_selection_desc": "Виділити від поточної позиції до цільового рядка"
   },
   "vi": {
-    "cmd.goto_line_with_selection": "Go to Line with Selection",
-    "cmd.goto_line_with_selection_desc": "Select from current position to target line"
+    "cmd.goto_line_with_selection": "Đến dòng với lựa chọn",
+    "cmd.goto_line_with_selection_desc": "Chọn từ vị trí hiện tại đến dòng đích"
   },
   "zh-CN": {
-    "cmd.goto_line_with_selection": "Go to Line with Selection",
-    "cmd.goto_line_with_selection_desc": "Select from current position to target line"
+    "cmd.goto_line_with_selection": "转到行并选中",
+    "cmd.goto_line_with_selection_desc": "从当前位置选中到目标行"
   }
 }
