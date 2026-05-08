@@ -6,7 +6,7 @@
 //! widget state, requested action) → next state — the dispatcher
 //! reads from the registry, calls these, and fires events.
 
-use fresh_core::api::WidgetSpec;
+use fresh_core::api::{TreeNode, WidgetSpec};
 use fresh_core::text_property::TextPropertyEntry;
 
 /// Locate a widget node in a spec tree by its stable `key`. Returns
@@ -32,6 +32,7 @@ pub fn find_widget_by_key<'a>(spec: &'a WidgetSpec, target: &str) -> Option<&'a 
         | WidgetSpec::Button { key: Some(k), .. }
         | WidgetSpec::TextInput { key: Some(k), .. }
         | WidgetSpec::List { key: Some(k), .. }
+        | WidgetSpec::Tree { key: Some(k), .. }
             if k == target =>
         {
             Some(spec)
@@ -182,7 +183,68 @@ pub fn set_list_items_in_spec(
     }
 }
 
-/// Recursive helper for `set_list_items_in_spec` — does this
+/// In-place mutate a `Tree`'s `nodes` and `item_keys` fields.
+/// Returns true when a matching Tree was found and updated.
+///
+/// Note: this does *not* touch instance state (selected_index,
+/// scroll, expanded_keys). The renderer will clamp the previous
+/// selection to a now-visible node and orphan-discard expanded
+/// keys that no longer match any item key on the next render.
+pub fn set_tree_nodes_in_spec(
+    spec: &mut WidgetSpec,
+    widget_key: &str,
+    new_nodes: Vec<TreeNode>,
+    new_item_keys: Vec<String>,
+) -> bool {
+    if widget_key.is_empty() {
+        return false;
+    }
+    match spec {
+        WidgetSpec::Row { children, .. } | WidgetSpec::Col { children, .. } => {
+            for c in children.iter_mut() {
+                if c.contains_key(widget_key) {
+                    return set_tree_nodes_in_spec(c, widget_key, new_nodes, new_item_keys);
+                }
+            }
+            false
+        }
+        WidgetSpec::Tree {
+            nodes,
+            item_keys,
+            key,
+            ..
+        } => {
+            if key.as_deref() == Some(widget_key) {
+                *nodes = new_nodes;
+                *item_keys = new_item_keys;
+                true
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Resolve the absolute `nodes` index of the parent of `child_idx`
+/// in a `Tree`. The parent of a node at depth `d` is the most recent
+/// earlier node at depth `d - 1`. Returns `None` for top-level nodes
+/// (depth 0) and for out-of-range indices.
+pub fn tree_parent_index(nodes: &[TreeNode], child_idx: usize) -> Option<usize> {
+    let child = nodes.get(child_idx)?;
+    if child.depth == 0 {
+        return None;
+    }
+    let target_depth = child.depth - 1;
+    nodes[..child_idx]
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, n)| n.depth == target_depth)
+        .map(|(i, _)| i)
+}
+
+/// Recursive helper for `set_*_in_spec` — does this
 /// subtree contain a widget (any kind) with `widget_key`?
 trait ContainsKey {
     fn contains_key(&self, widget_key: &str) -> bool;
@@ -197,7 +259,8 @@ impl ContainsKey for WidgetSpec {
             WidgetSpec::Toggle { key, .. }
             | WidgetSpec::Button { key, .. }
             | WidgetSpec::TextInput { key, .. }
-            | WidgetSpec::List { key, .. } => key.as_deref() == Some(widget_key),
+            | WidgetSpec::List { key, .. }
+            | WidgetSpec::Tree { key, .. } => key.as_deref() == Some(widget_key),
             _ => false,
         }
     }
@@ -328,5 +391,92 @@ mod tests {
         // From byte 1 (before 'é'), Right goes to byte 3 (after 'é').
         let (_, cursor) = apply_text_input_key(s, 1, "Right");
         assert_eq!(cursor, 3);
+    }
+
+    fn node(text: &str, depth: u32, has_children: bool) -> TreeNode {
+        TreeNode {
+            text: TextPropertyEntry::text(text),
+            depth,
+            has_children,
+        }
+    }
+
+    #[test]
+    fn tree_parent_index_top_level_returns_none() {
+        let nodes = vec![node("root", 0, true)];
+        assert!(tree_parent_index(&nodes, 0).is_none());
+    }
+
+    #[test]
+    fn tree_parent_index_finds_immediate_parent() {
+        let nodes = vec![
+            node("root", 0, true),
+            node("child", 1, false),
+            node("child2", 1, false),
+        ];
+        assert_eq!(tree_parent_index(&nodes, 1), Some(0));
+        assert_eq!(tree_parent_index(&nodes, 2), Some(0));
+    }
+
+    #[test]
+    fn tree_parent_index_skips_intermediate_siblings() {
+        // root, child, grandchild → grandchild's parent is child (idx 1).
+        let nodes = vec![
+            node("root", 0, true),
+            node("child", 1, true),
+            node("grand", 2, false),
+        ];
+        assert_eq!(tree_parent_index(&nodes, 2), Some(1));
+    }
+
+    #[test]
+    fn tree_parent_index_finds_parent_across_unrelated_subtree() {
+        // root_a, child_a, root_b, child_b — child_b's parent is root_b (idx 2),
+        // not root_a.
+        let nodes = vec![
+            node("a", 0, true),
+            node("a.0", 1, false),
+            node("b", 0, true),
+            node("b.0", 1, false),
+        ];
+        assert_eq!(tree_parent_index(&nodes, 3), Some(2));
+    }
+
+    #[test]
+    fn set_tree_nodes_in_spec_replaces_nodes() {
+        let mut spec = WidgetSpec::Tree {
+            nodes: vec![node("old", 0, false)],
+            item_keys: vec!["k0".into()],
+            selected_index: -1,
+            visible_rows: 5,
+            expanded_keys: vec![],
+            key: Some("t".into()),
+        };
+        let new_nodes = vec![node("new1", 0, false), node("new2", 0, false)];
+        let new_keys = vec!["a".to_string(), "b".to_string()];
+        let ok = set_tree_nodes_in_spec(&mut spec, "t", new_nodes.clone(), new_keys.clone());
+        assert!(ok);
+        match &spec {
+            WidgetSpec::Tree {
+                nodes, item_keys, ..
+            } => {
+                assert_eq!(nodes.len(), 2);
+                assert_eq!(item_keys, &new_keys);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn set_tree_nodes_in_spec_returns_false_for_unknown_key() {
+        let mut spec = WidgetSpec::Tree {
+            nodes: vec![node("a", 0, false)],
+            item_keys: vec!["k".into()],
+            selected_index: -1,
+            visible_rows: 5,
+            expanded_keys: vec![],
+            key: Some("real".into()),
+        };
+        assert!(!set_tree_nodes_in_spec(&mut spec, "wrong", vec![], vec![]));
     }
 }

@@ -55,6 +55,34 @@ fn buffer_line_byte_offset(
     }
 }
 
+/// Walk a `Tree`'s flat `nodes` and return the absolute indices of
+/// nodes that are currently visible — i.e. every ancestor is in
+/// `expanded`. Mirrors the renderer's filter so dispatcher and
+/// renderer agree on what's selectable.
+fn collect_visible_tree_indices(
+    nodes: &[fresh_core::api::TreeNode],
+    item_keys: &[String],
+    expanded: &std::collections::HashSet<String>,
+) -> Vec<usize> {
+    let mut ancestor_open: Vec<bool> = Vec::new();
+    let mut visible: Vec<usize> = Vec::with_capacity(nodes.len());
+    for (i, node) in nodes.iter().enumerate() {
+        let depth = node.depth as usize;
+        ancestor_open.truncate(depth);
+        if ancestor_open.iter().all(|open| *open) {
+            visible.push(i);
+        }
+        let key = item_keys.get(i).cloned().unwrap_or_default();
+        let is_open = if node.has_children {
+            !key.is_empty() && expanded.contains(&key)
+        } else {
+            true
+        };
+        ancestor_open.push(is_open);
+    }
+    visible
+}
+
 impl Editor {
     /// Update the plugin state snapshot with current editor state
     #[cfg(feature = "plugins")]
@@ -3402,6 +3430,28 @@ impl Editor {
                     );
                 }
             }
+            WidgetMutation::SetExpandedKeys { widget_key, keys } => {
+                // Tree expanded_keys lives in instance state.
+                if let Some(panel) = self.widget_registry.get_mut(panel_id) {
+                    let (prev_scroll, prev_sel) = match panel.instance_states.get(&widget_key) {
+                        Some(crate::widgets::WidgetInstanceState::Tree {
+                            scroll_offset,
+                            selected_index,
+                            ..
+                        }) => (*scroll_offset, *selected_index),
+                        _ => (0, -1),
+                    };
+                    let expanded: std::collections::HashSet<String> = keys.into_iter().collect();
+                    panel.instance_states.insert(
+                        widget_key,
+                        crate::widgets::WidgetInstanceState::Tree {
+                            scroll_offset: prev_scroll,
+                            selected_index: prev_sel,
+                            expanded_keys: expanded,
+                        },
+                    );
+                }
+            }
         }
 
         // Re-render with the mutated state. `rerender_widget_panel`
@@ -3452,12 +3502,27 @@ impl Editor {
             "Tab" => self.handle_widget_focus_advance(panel_id, 1),
             "Shift+Tab" => self.handle_widget_focus_advance(panel_id, -1),
             "Up" | "Down" => {
-                if let Some(fresh_core::api::WidgetSpec::List { .. }) = widget {
-                    let delta = if key == "Up" { -1 } else { 1 };
-                    self.handle_widget_select_move(panel_id, delta);
+                let delta = if key == "Up" { -1 } else { 1 };
+                match widget {
+                    Some(fresh_core::api::WidgetSpec::List { .. }) => {
+                        self.handle_widget_select_move(panel_id, delta);
+                    }
+                    Some(fresh_core::api::WidgetSpec::Tree { .. }) => {
+                        self.handle_widget_tree_select_move(panel_id, delta);
+                    }
+                    _ => {}
                 }
             }
-            "Backspace" | "Delete" | "Left" | "Right" | "Home" | "End" => {
+            "Left" | "Right" => match widget {
+                Some(fresh_core::api::WidgetSpec::TextInput { .. }) => {
+                    self.handle_widget_text_input_key(panel_id, key);
+                }
+                Some(fresh_core::api::WidgetSpec::Tree { .. }) => {
+                    self.handle_widget_tree_lateral(panel_id, key == "Right");
+                }
+                _ => {}
+            },
+            "Backspace" | "Delete" | "Home" | "End" => {
                 if matches!(widget, Some(fresh_core::api::WidgetSpec::TextInput { .. })) {
                     self.handle_widget_text_input_key(panel_id, key);
                 }
@@ -3469,6 +3534,9 @@ impl Editor {
                 }
                 Some(fresh_core::api::WidgetSpec::List { .. }) => {
                     self.fire_list_activate(panel_id, &focus_key);
+                }
+                Some(fresh_core::api::WidgetSpec::Tree { .. }) => {
+                    self.fire_tree_activate(panel_id, &focus_key);
                 }
                 _ => {}
             },
@@ -3482,6 +3550,9 @@ impl Editor {
                 }
                 Some(fresh_core::api::WidgetSpec::List { .. }) => {
                     self.fire_list_activate(panel_id, &focus_key);
+                }
+                Some(fresh_core::api::WidgetSpec::Tree { .. }) => {
+                    self.fire_tree_activate(panel_id, &focus_key);
                 }
                 _ => {}
             },
@@ -3650,6 +3721,313 @@ impl Editor {
                     widget_key: focus_key,
                     event_type: "select".into(),
                     payload: serde_json::json!({ "index": new_sel, "key": new_key }),
+                },
+            );
+        }
+    }
+
+    /// Move the focused Tree's selection up/down, skipping
+    /// descendants of collapsed nodes. Selection is the *absolute*
+    /// `nodes` index; we walk the visible-flat order to find the
+    /// neighbour. Mirrors the List handler shape but tree-aware.
+    fn handle_widget_tree_select_move(&mut self, panel_id: u64, delta: i32) {
+        let panel = match self.widget_registry.get(panel_id) {
+            Some(p) => p,
+            None => return,
+        };
+        let focus_key = panel.focus_key.clone();
+        if focus_key.is_empty() {
+            return;
+        }
+        let widget = crate::widgets::find_widget_by_key(&panel.spec, &focus_key);
+        let (spec_sel, nodes, item_keys) = match widget {
+            Some(fresh_core::api::WidgetSpec::Tree {
+                selected_index,
+                nodes,
+                item_keys,
+                ..
+            }) => (*selected_index, nodes.clone(), item_keys.clone()),
+            _ => return,
+        };
+        if nodes.is_empty() {
+            return;
+        }
+        let (cur_sel, cur_scroll, expanded) = match panel.instance_states.get(&focus_key) {
+            Some(crate::widgets::WidgetInstanceState::Tree {
+                selected_index,
+                scroll_offset,
+                expanded_keys,
+            }) => (*selected_index, *scroll_offset, expanded_keys.clone()),
+            _ => (
+                spec_sel,
+                0u32,
+                std::collections::HashSet::<String>::new(),
+            ),
+        };
+        // Build the visible-index list using the same rule as the
+        // renderer: a node is visible iff every ancestor is expanded.
+        let visible_indices = collect_visible_tree_indices(&nodes, &item_keys, &expanded);
+        if visible_indices.is_empty() {
+            return;
+        }
+        // Find current selection's position in the visible list.
+        let cur_pos = if cur_sel < 0 {
+            // No selection — Down picks the first visible node, Up
+            // picks the last. Match List semantics for "press Down
+            // when nothing selected".
+            if delta > 0 {
+                -1
+            } else {
+                visible_indices.len() as i32
+            }
+        } else {
+            visible_indices
+                .iter()
+                .position(|&v| v as i32 == cur_sel)
+                .map(|p| p as i32)
+                .unwrap_or(-1)
+        };
+        let new_pos = (cur_pos + delta).clamp(0, (visible_indices.len() as i32) - 1);
+        let new_abs = visible_indices[new_pos as usize];
+        let new_key = item_keys.get(new_abs).cloned().unwrap_or_default();
+        if let Some(panel_mut) = self.widget_registry.get_mut(panel_id) {
+            panel_mut.instance_states.insert(
+                focus_key.clone(),
+                crate::widgets::WidgetInstanceState::Tree {
+                    scroll_offset: cur_scroll,
+                    selected_index: new_abs as i32,
+                    expanded_keys: expanded,
+                },
+            );
+        }
+        self.rerender_widget_panel(panel_id);
+        if self.plugin_manager.has_hook_handlers("widget_event") {
+            self.plugin_manager.run_hook(
+                "widget_event",
+                fresh_core::hooks::HookArgs::WidgetEvent {
+                    panel_id,
+                    widget_key: focus_key,
+                    event_type: "select".into(),
+                    payload: serde_json::json!({ "index": new_abs as i64, "key": new_key }),
+                },
+            );
+        }
+    }
+
+    /// Right/Left arrow on a focused Tree.
+    ///
+    /// * Right: if the selected node has children and is collapsed,
+    ///   expand it. Else no-op.
+    /// * Left: if the selected node has children and is expanded,
+    ///   collapse it. Else move selection up to the parent.
+    ///
+    /// Both update host instance state, re-render, and (when a
+    /// change happened) fire `widget_event { event_type: "expand" }`.
+    fn handle_widget_tree_lateral(&mut self, panel_id: u64, is_right: bool) {
+        let panel = match self.widget_registry.get(panel_id) {
+            Some(p) => p,
+            None => return,
+        };
+        let focus_key = panel.focus_key.clone();
+        if focus_key.is_empty() {
+            return;
+        }
+        let widget = crate::widgets::find_widget_by_key(&panel.spec, &focus_key);
+        let (spec_sel, nodes, item_keys) = match widget {
+            Some(fresh_core::api::WidgetSpec::Tree {
+                selected_index,
+                nodes,
+                item_keys,
+                ..
+            }) => (*selected_index, nodes.clone(), item_keys.clone()),
+            _ => return,
+        };
+        if nodes.is_empty() {
+            return;
+        }
+        let (cur_sel, cur_scroll, mut expanded) = match panel.instance_states.get(&focus_key) {
+            Some(crate::widgets::WidgetInstanceState::Tree {
+                selected_index,
+                scroll_offset,
+                expanded_keys,
+            }) => (*selected_index, *scroll_offset, expanded_keys.clone()),
+            _ => (
+                spec_sel,
+                0u32,
+                std::collections::HashSet::<String>::new(),
+            ),
+        };
+        if cur_sel < 0 {
+            return;
+        }
+        let sel_idx = cur_sel as usize;
+        let node = match nodes.get(sel_idx) {
+            Some(n) => n,
+            None => return,
+        };
+        let key = item_keys.get(sel_idx).cloned().unwrap_or_default();
+        let was_expanded = !key.is_empty() && expanded.contains(&key);
+
+        let mut new_sel = cur_sel;
+        let mut expansion_changed: Option<bool> = None; // Some(new_state)
+        if is_right {
+            if node.has_children && !was_expanded && !key.is_empty() {
+                expanded.insert(key.clone());
+                expansion_changed = Some(true);
+            }
+        } else if node.has_children && was_expanded && !key.is_empty() {
+            expanded.remove(&key);
+            expansion_changed = Some(false);
+        } else if let Some(parent_idx) = crate::widgets::tree_parent_index(&nodes, sel_idx) {
+            new_sel = parent_idx as i32;
+        }
+        // No change → bail (don't fire spurious select/expand).
+        if expansion_changed.is_none() && new_sel == cur_sel {
+            return;
+        }
+        let final_key = item_keys.get(new_sel as usize).cloned().unwrap_or_default();
+        if let Some(panel_mut) = self.widget_registry.get_mut(panel_id) {
+            panel_mut.instance_states.insert(
+                focus_key.clone(),
+                crate::widgets::WidgetInstanceState::Tree {
+                    scroll_offset: cur_scroll,
+                    selected_index: new_sel,
+                    expanded_keys: expanded,
+                },
+            );
+        }
+        self.rerender_widget_panel(panel_id);
+        if self.plugin_manager.has_hook_handlers("widget_event") {
+            if let Some(now_expanded) = expansion_changed {
+                self.plugin_manager.run_hook(
+                    "widget_event",
+                    fresh_core::hooks::HookArgs::WidgetEvent {
+                        panel_id,
+                        widget_key: focus_key.clone(),
+                        event_type: "expand".into(),
+                        payload: serde_json::json!({
+                            "index": cur_sel as i64,
+                            "key": key,
+                            "expanded": now_expanded,
+                        }),
+                    },
+                );
+            } else if new_sel != cur_sel {
+                self.plugin_manager.run_hook(
+                    "widget_event",
+                    fresh_core::hooks::HookArgs::WidgetEvent {
+                        panel_id,
+                        widget_key: focus_key,
+                        event_type: "select".into(),
+                        payload: serde_json::json!({
+                            "index": new_sel as i64,
+                            "key": final_key,
+                        }),
+                    },
+                );
+            }
+        }
+    }
+
+    /// Toggle a Tree node's expansion state, re-render, and fire
+    /// `widget_event { event_type: "expand" }`. Used by the click
+    /// handler when the user clicks the disclosure column.
+    pub(crate) fn handle_widget_tree_expand_toggle(
+        &mut self,
+        panel_id: u64,
+        widget_key: &str,
+        item_key: &str,
+    ) {
+        if widget_key.is_empty() || item_key.is_empty() {
+            return;
+        }
+        let now_expanded = {
+            let panel = match self.widget_registry.get_mut(panel_id) {
+                Some(p) => p,
+                None => return,
+            };
+            let (cur_scroll, cur_sel, mut expanded) =
+                match panel.instance_states.get(widget_key) {
+                    Some(crate::widgets::WidgetInstanceState::Tree {
+                        scroll_offset,
+                        selected_index,
+                        expanded_keys,
+                    }) => (*scroll_offset, *selected_index, expanded_keys.clone()),
+                    _ => (0u32, -1i32, std::collections::HashSet::<String>::new()),
+                };
+            let next = if expanded.contains(item_key) {
+                expanded.remove(item_key);
+                false
+            } else {
+                expanded.insert(item_key.to_string());
+                true
+            };
+            panel.instance_states.insert(
+                widget_key.to_string(),
+                crate::widgets::WidgetInstanceState::Tree {
+                    scroll_offset: cur_scroll,
+                    selected_index: cur_sel,
+                    expanded_keys: expanded,
+                },
+            );
+            next
+        };
+        self.rerender_widget_panel(panel_id);
+        if self.plugin_manager.has_hook_handlers("widget_event") {
+            self.plugin_manager.run_hook(
+                "widget_event",
+                fresh_core::hooks::HookArgs::WidgetEvent {
+                    panel_id,
+                    widget_key: widget_key.to_string(),
+                    event_type: "expand".into(),
+                    payload: serde_json::json!({
+                        "key": item_key,
+                        "expanded": now_expanded,
+                    }),
+                },
+            );
+        }
+    }
+
+    /// Fire `widget_event { event_type: "activate" }` for the focused
+    /// Tree's currently-selected node. Mirrors `fire_list_activate`
+    /// — the plugin's handler decides what "activate" means
+    /// (open the file, run an action, etc.).
+    fn fire_tree_activate(&mut self, panel_id: u64, focus_key: &str) {
+        let panel = match self.widget_registry.get(panel_id) {
+            Some(p) => p,
+            None => return,
+        };
+        let widget = crate::widgets::find_widget_by_key(&panel.spec, focus_key);
+        let (spec_sel, item_keys) = match widget {
+            Some(fresh_core::api::WidgetSpec::Tree {
+                selected_index,
+                item_keys,
+                ..
+            }) => (*selected_index, item_keys.clone()),
+            _ => return,
+        };
+        let sel = match panel.instance_states.get(focus_key) {
+            Some(crate::widgets::WidgetInstanceState::Tree { selected_index, .. }) => {
+                *selected_index
+            }
+            _ => spec_sel,
+        };
+        if sel < 0 {
+            return;
+        }
+        let item_key = item_keys.get(sel as usize).cloned().unwrap_or_default();
+        if self.plugin_manager.has_hook_handlers("widget_event") {
+            self.plugin_manager.run_hook(
+                "widget_event",
+                fresh_core::hooks::HookArgs::WidgetEvent {
+                    panel_id,
+                    widget_key: focus_key.to_string(),
+                    event_type: "activate".into(),
+                    payload: serde_json::json!({
+                        "index": sel,
+                        "key": item_key,
+                    }),
                 },
             );
         }

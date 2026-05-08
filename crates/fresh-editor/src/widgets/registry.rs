@@ -9,7 +9,7 @@
 
 use fresh_core::api::WidgetSpec;
 use fresh_core::BufferId;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Plugin-allocated panel identifier. Unique within a plugin; the
 /// editor does not interpret the value.
@@ -79,6 +79,18 @@ pub enum WidgetInstanceState {
     /// `WidgetCommand` mutations because the host doesn't read
     /// from the spec for value at all once instance state exists.
     TextInput { value: String, cursor_byte: u32 },
+    /// `Tree` instance state: host-owned scroll offset, selected
+    /// index, and the set of expanded item keys. All three become
+    /// authoritative after first render — the spec's
+    /// `selected_index` / `expanded_keys` are seed values only.
+    /// `expanded_keys` is a `HashSet` because expansion is
+    /// set-membership semantically (a key is either expanded or
+    /// not); ordering doesn't matter and we hit-test on contains.
+    Tree {
+        scroll_offset: u32,
+        selected_index: i32,
+        expanded_keys: HashSet<String>,
+    },
 }
 
 /// Per-panel state retained between renders. The reconciler will use

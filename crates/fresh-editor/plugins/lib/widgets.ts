@@ -44,6 +44,7 @@ export type HintEntry = globalThis.HintEntry;
 export type ButtonKind = globalThis.ButtonKind;
 export type WidgetAction = globalThis.WidgetAction;
 export type WidgetMutation = globalThis.WidgetMutation;
+export type TreeNode = globalThis.TreeNode;
 type TextPropertyEntry = globalThis.TextPropertyEntry;
 
 // =============================================================================
@@ -155,6 +156,65 @@ export function list(options: {
     itemKeys: options.itemKeys ?? [],
     selectedIndex: options.selectedIndex ?? -1,
     visibleRows: options.visibleRows,
+    key: options.key,
+  };
+}
+
+/** Construct one node in a `Tree` widget's flat-list spec. The
+ * plugin emits a depth-first traversal of its hierarchy, one
+ * `treeNode(...)` per node, plus a parallel `itemKeys` array for
+ * stable per-row identifiers. `depth` controls indent (`depth * 2`
+ * spaces); `hasChildren: true` renders a disclosure glyph (`▶`/`▼`)
+ * with a click-to-expand hit area in the indent column. The host
+ * filters out descendants of collapsed nodes when rendering. */
+export function treeNode(
+  text: TextPropertyEntry,
+  options?: { depth?: number; hasChildren?: boolean },
+): TreeNode {
+  return {
+    text,
+    depth: options?.depth ?? 0,
+    hasChildren: options?.hasChildren ?? false,
+  };
+}
+
+/** Hierarchical tree with host-managed expand/collapse, selection,
+ * scrolling, and click routing.
+ *
+ * The plugin emits its hierarchy as a flat list of `TreeNode`s
+ * (depth-first); the host filters out descendants of collapsed
+ * nodes at render time. **Toggling expansion is host-owned** —
+ * `Right`/`Left` arrow keys and disclosure clicks update host
+ * instance state without the plugin re-emitting. Plugins that
+ * need to react to expansion changes listen for
+ * `widget_event` `eventType: "expand"`.
+ *
+ * Click on the disclosure column → `expand` event. Click on the
+ * row body → `select` event. Enter/Space on the focused tree →
+ * `activate` event with the currently-selected node. Up/Down move
+ * selection through the visible (un-collapsed) flat list.
+ *
+ * `key` is required for any Tree that should preserve scroll +
+ * selection + expansion across re-renders. */
+export function tree(options: {
+  nodes: TreeNode[];
+  itemKeys?: string[];
+  selectedIndex?: number;
+  visibleRows: number;
+  /** Initial expanded keys; subsequent expansion changes are
+   * host-owned and don't read this field. Use
+   * `panel.setExpandedKeys(...)` to override host state after
+   * mount. */
+  expandedKeys?: string[];
+  key?: string;
+}): WidgetSpec {
+  return {
+    kind: "tree",
+    nodes: options.nodes,
+    itemKeys: options.itemKeys ?? [],
+    selectedIndex: options.selectedIndex ?? -1,
+    visibleRows: options.visibleRows,
+    expandedKeys: options.expandedKeys ?? [],
     key: options.key,
   };
 }
@@ -325,6 +385,14 @@ export class WidgetPanel {
     itemKeys: string[] = [],
   ): boolean {
     return this.mutate({ kind: "setItems", widgetKey, items, itemKeys });
+  }
+
+  /** Replace a `Tree`'s expanded-keys instance state. The host
+   * normally owns expansion (Right/Left arrows + disclosure
+   * clicks); use this when a non-user action drives expansion
+   * (e.g. "expand all", reveal-on-search). */
+  setExpandedKeys(widgetKey: string, keys: string[]): boolean {
+    return this.mutate({ kind: "setExpandedKeys", widgetKey, keys });
   }
 }
 

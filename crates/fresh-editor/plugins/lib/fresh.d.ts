@@ -693,6 +693,26 @@ type HintEntry = {
 	label: string;
 };
 type ButtonKind = "normal" | "primary" | "danger";
+type TreeNode = {
+	/**
+	* The pre-rendered row content (text + per-row overlays).
+	* The host renders this verbatim after the indent + disclosure
+	* prefix; plugin overlays are byte-shifted by the prefix
+	* length.
+	*/
+	text: TextPropertyEntry;
+	/**
+	* 0-based depth — controls leading indent (`depth * 2` spaces).
+	*/
+	depth: number;
+	/**
+	* When true, render a disclosure glyph (`▶` collapsed / `▼`
+	* expanded) and emit a hit area over it that fires the `expand`
+	* event. Leaf nodes (`false`) get no glyph and no expand hit;
+	* the row width occupies the full row.
+	*/
+	hasChildren: boolean;
+};
 type WidgetSpec = {
 	"kind": "row";
 	children: Array<WidgetSpec>;
@@ -733,6 +753,21 @@ type WidgetSpec = {
 	* host shows up to this many items per render.
 	*/
 	visibleRows: number;
+	key?: string | null;
+} | {
+	"kind": "tree";
+	nodes: Array<TreeNode>;
+	itemKeys: Array<string>;
+	selectedIndex: number;
+	visibleRows: number;
+	/**
+	* Initial-only set of expanded item keys. Once the widget
+	* has rendered, the host's instance-state `expanded_keys`
+	* is authoritative; updating this field on subsequent specs
+	* has no effect (use `WidgetMutation::SetExpandedKeys` to
+	* override host state).
+	*/
+	expandedKeys: Array<string>;
 	key?: string | null;
 } | {
 	"kind": "textInput";
@@ -819,6 +854,10 @@ type WidgetMutation = {
 	widgetKey: string;
 	items: Array<TextPropertyEntry>;
 	itemKeys: Array<string>;
+} | {
+	"kind": "setExpandedKeys";
+	widgetKey: string;
+	keys: Array<string>;
 };
 type AuthorityFilesystem = {
 	kind: "local";

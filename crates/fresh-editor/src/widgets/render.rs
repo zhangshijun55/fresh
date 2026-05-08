@@ -21,10 +21,12 @@
 //! changing the public function signature.
 
 use crate::widgets::registry::{HitArea, WidgetInstanceState};
-use fresh_core::api::{ButtonKind, HintEntry, OverlayColorSpec, OverlayOptions, WidgetSpec};
+use fresh_core::api::{
+    ButtonKind, HintEntry, OverlayColorSpec, OverlayOptions, TreeNode, WidgetSpec,
+};
 use fresh_core::text_property::{InlineOverlay, TextPropertyEntry};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 // Theme keys used by the v1 widget renderers. Centralized so future
 // "role-based" theming (§7 of the design doc) has one place to
@@ -160,7 +162,7 @@ fn ensure_trailing_newline(entry: &mut TextPropertyEntry) {
 }
 
 /// Walk a spec tree and append tabbable widget keys (`Toggle`,
-/// `Button`, `TextInput`, `List` with a non-empty `key`) in
+/// `Button`, `TextInput`, `List`, `Tree` with a non-empty `key`) in
 /// declaration order. Layout containers (`Row`, `Col`) recurse;
 /// `Raw`, `Spacer`, `HintBar` skip.
 fn collect_tabbable(spec: &WidgetSpec, out: &mut Vec<String>) {
@@ -174,6 +176,7 @@ fn collect_tabbable(spec: &WidgetSpec, out: &mut Vec<String>) {
         | WidgetSpec::Button { key: Some(k), .. }
         | WidgetSpec::TextInput { key: Some(k), .. }
         | WidgetSpec::List { key: Some(k), .. }
+        | WidgetSpec::Tree { key: Some(k), .. }
             if !k.is_empty() =>
         {
             out.push(k.clone());
@@ -559,6 +562,203 @@ fn render_collected(
                 });
             }
         }
+        WidgetSpec::Tree {
+            nodes,
+            item_keys,
+            selected_index,
+            visible_rows,
+            expanded_keys,
+            key: tree_key,
+        } => {
+            // Look up host-owned instance state (scroll, selection,
+            // expanded set). Spec values are initial-only.
+            let prev_state = tree_key
+                .as_deref()
+                .filter(|k| !k.is_empty())
+                .and_then(|k| prev.get(k));
+            let (prev_scroll, prev_sel, prev_expanded) = match prev_state {
+                Some(WidgetInstanceState::Tree {
+                    scroll_offset,
+                    selected_index,
+                    expanded_keys,
+                }) => (*scroll_offset, *selected_index, expanded_keys.clone()),
+                _ => {
+                    // First render: seed expanded_keys from spec.
+                    let seeded: HashSet<String> = expanded_keys.iter().cloned().collect();
+                    (0, *selected_index, seeded)
+                }
+            };
+
+            // Compute the visible (un-collapsed) flat slice of the
+            // full `nodes` list. A node at depth d is visible iff
+            // every ancestor (the most recent earlier node at depth
+            // d-1, that node's most recent earlier at d-2, etc.) is
+            // expanded. Walk linearly tracking ancestor expansion at
+            // each depth — set ancestor[d] = is_expanded(node) when
+            // we visit a node at depth d, and consider a node
+            // visible iff ancestor[0..node.depth] are all true.
+            //
+            // O(N * max_depth) — fine; trees in this editor are
+            // shallow (filesystem trees, search-results trees).
+            let mut ancestor_open: Vec<bool> = Vec::new();
+            let mut visible_indices: Vec<usize> = Vec::with_capacity(nodes.len());
+            for (i, node) in nodes.iter().enumerate() {
+                let depth = node.depth as usize;
+                // Truncate the ancestor stack to this node's depth.
+                ancestor_open.truncate(depth);
+                let visible = ancestor_open.iter().all(|open| *open);
+                if visible {
+                    visible_indices.push(i);
+                }
+                // Push this node's own openness onto the stack so
+                // descendants see it. The node is "open" iff it has
+                // children AND its key is in expanded_keys; leaves
+                // act like open nodes (their nonexistent descendants
+                // can't be hidden anyway).
+                let key = item_keys.get(i).cloned().unwrap_or_default();
+                let is_open = if node.has_children {
+                    !key.is_empty() && prev_expanded.contains(&key)
+                } else {
+                    true
+                };
+                ancestor_open.push(is_open);
+            }
+
+            // Clamp the previous selection to a visible index. The
+            // selected_index in the spec/instance state references
+            // the *absolute* `nodes` index; if that node is now
+            // hidden (parent collapsed), find the closest visible
+            // node at-or-before it. If no visible nodes, -1.
+            let total_visible = visible_indices.len() as u32;
+            let visible = (*visible_rows).max(1);
+            let clamp_to_visible = |abs: i32| -> i32 {
+                if abs < 0 || nodes.is_empty() {
+                    return -1;
+                }
+                let abs = abs.min((nodes.len() as i32) - 1) as usize;
+                if let Ok(_pos) = visible_indices.binary_search(&abs) {
+                    return abs as i32;
+                }
+                // Not visible — fall back to the nearest earlier
+                // visible node, else the first visible node, else -1.
+                let earlier = visible_indices.iter().rev().find(|&&v| v <= abs);
+                if let Some(&v) = earlier {
+                    return v as i32;
+                }
+                visible_indices.first().map(|&v| v as i32).unwrap_or(-1)
+            };
+            let effective_sel_abs = clamp_to_visible(prev_sel);
+            // Find the position of the selected absolute index in
+            // visible_indices — that's its "visible-window position"
+            // used for scroll math.
+            let sel_visible_pos: i32 = if effective_sel_abs < 0 {
+                -1
+            } else {
+                visible_indices
+                    .iter()
+                    .position(|&v| v == effective_sel_abs as usize)
+                    .map(|p| p as i32)
+                    .unwrap_or(-1)
+            };
+
+            // Compute scroll: same auto-clamp logic as List, but
+            // operating on the visible-windowed indices.
+            let mut scroll = prev_scroll;
+            if sel_visible_pos >= 0 {
+                let sel = sel_visible_pos as u32;
+                if sel < scroll {
+                    scroll = sel;
+                }
+                if sel >= scroll + visible {
+                    scroll = sel + 1 - visible;
+                }
+            }
+            let max_scroll = total_visible.saturating_sub(visible);
+            if scroll > max_scroll {
+                scroll = max_scroll;
+            }
+
+            // Persist instance state.
+            if let Some(k) = tree_key.as_deref().filter(|k| !k.is_empty()) {
+                next_state.insert(
+                    k.to_string(),
+                    WidgetInstanceState::Tree {
+                        scroll_offset: scroll,
+                        selected_index: effective_sel_abs,
+                        expanded_keys: prev_expanded.clone(),
+                    },
+                );
+            }
+
+            // Render the visible window.
+            let start = scroll as usize;
+            let end = ((scroll + visible) as usize).min(visible_indices.len());
+            for &abs_idx in &visible_indices[start..end] {
+                let node = &nodes[abs_idx];
+                let item_key = item_keys.get(abs_idx).cloned().unwrap_or_default();
+                let is_expanded = node.has_children
+                    && !item_key.is_empty()
+                    && prev_expanded.contains(&item_key);
+                let rendered = render_tree_row(node, is_expanded);
+                let mut entry = rendered.entry;
+                let is_selected = abs_idx as i32 == effective_sel_abs;
+                if is_selected {
+                    let mut style = entry.style.unwrap_or_default();
+                    style.bg = Some(OverlayColorSpec::theme_key(KEY_FOCUSED_BG));
+                    style.extend_to_line_end = true;
+                    entry.style = Some(style);
+                }
+                let row_byte_end = entry.text.len();
+                ensure_trailing_newline(&mut entry);
+                entries.push(entry);
+                let hit_row = (entries.len() - 1) as u32;
+                // Disclosure hit (only when has_children) — fires
+                // `expand`. The host toggles instance-state
+                // `expanded_keys` and re-renders before firing the
+                // event; the plugin only listens if it cares about
+                // expansion changes.
+                // Tree hits use the *tree's* spec key for
+                // `widget_key` (so click-to-focus works the same
+                // as Toggle/Button — the tree is tabbable). The
+                // per-row key travels in the payload.
+                let tree_spec_key = tree_key.clone().unwrap_or_default();
+                if let Some(disc_range) = rendered.disclosure_range {
+                    hits.push(HitArea {
+                        widget_key: tree_spec_key.clone(),
+                        widget_kind: "tree",
+                        buffer_row: hit_row,
+                        byte_start: disc_range.0,
+                        byte_end: disc_range.1,
+                        payload: json!({
+                            "index": abs_idx as i64,
+                            "key": item_key.clone(),
+                            "expanded": !is_expanded,
+                        }),
+                        event_type: "expand",
+                    });
+                }
+                // Row body hit — fires `select`. Spans the rest of
+                // the row text (or all of it for a leaf).
+                let body_start = match rendered.disclosure_range {
+                    Some((_, end)) => end,
+                    None => 0,
+                };
+                if body_start < row_byte_end {
+                    hits.push(HitArea {
+                        widget_key: tree_spec_key,
+                        widget_kind: "tree",
+                        buffer_row: hit_row,
+                        byte_start: body_start,
+                        byte_end: row_byte_end,
+                        payload: json!({
+                            "index": abs_idx as i64,
+                            "key": item_key,
+                        }),
+                        event_type: "select",
+                    });
+                }
+            }
+        }
         WidgetSpec::TextInput {
             value,
             cursor_byte,
@@ -806,6 +1006,109 @@ pub fn render_button(label: &str, focused: bool, kind: ButtonKind) -> TextProper
         properties: Default::default(),
         style: None,
         inline_overlays: overlays,
+    }
+}
+
+/// Output of `render_tree_row` — the rendered entry plus the byte
+/// range covered by the disclosure glyph (when present) so the
+/// caller can emit a separate hit area for click-to-expand.
+pub struct RenderedTreeRow {
+    pub entry: TextPropertyEntry,
+    /// Byte range within `entry.text` of the disclosure glyph
+    /// (`▶`/`▼`). `None` for leaf nodes (no glyph rendered).
+    pub disclosure_range: Option<(usize, usize)>,
+}
+
+/// Render a single `TreeNode` row.
+///
+/// Layout: `<indent><disclosure><space><node-text>` where:
+/// * `indent` = `depth * 2` spaces.
+/// * `disclosure` = `▶` (collapsed) / `▼` (expanded) for internal
+///   nodes; two spaces (alignment) for leaves.
+/// * `<node-text>` is the plugin's pre-rendered row content, with
+///   its inline overlays byte-shifted by the prefix length.
+///
+/// The disclosure glyph is colored with `ui.help_key_fg` so it
+/// reads as a control surface against the row's text.
+pub fn render_tree_row(node: &TreeNode, expanded: bool) -> RenderedTreeRow {
+    let indent_cols = (node.depth as usize) * 2;
+    let disclosure_glyph: &str = if node.has_children {
+        if expanded {
+            "▼"
+        } else {
+            "▶"
+        }
+    } else {
+        // Two spaces — same display width as the glyph plus space,
+        // keeping leaf rows aligned with their internal siblings.
+        "  "
+    };
+    // `disclosure_glyph` (▶/▼) is 1 column wide; we want the row
+    // text to start at the same column whether or not the row is
+    // a leaf. With glyph + one separator space, that's 2 cols. The
+    // leaf branch uses two literal spaces for the same width.
+    let separator: &str = if node.has_children { " " } else { "" };
+
+    let mut text = String::with_capacity(
+        indent_cols + disclosure_glyph.len() + separator.len() + node.text.text.len(),
+    );
+    for _ in 0..indent_cols {
+        text.push(' ');
+    }
+    let disc_start = text.len();
+    text.push_str(disclosure_glyph);
+    let disc_end = text.len();
+    text.push_str(separator);
+    let body_start = text.len();
+    text.push_str(&node.text.text);
+
+    // Carry over the plugin's inline overlays, shifted right by
+    // `body_start` so they land on the correct bytes after the
+    // prefix.
+    let mut overlays: Vec<InlineOverlay> = node
+        .text
+        .inline_overlays
+        .iter()
+        .map(|o| {
+            let mut shifted = o.clone();
+            shifted.start += body_start;
+            shifted.end += body_start;
+            shifted
+        })
+        .collect();
+
+    // Disclosure glyph color — only on internal nodes, where the
+    // glyph is a real character (not just two spaces).
+    if node.has_children {
+        overlays.push(InlineOverlay {
+            start: disc_start,
+            end: disc_end,
+            style: OverlayOptions {
+                fg: Some(OverlayColorSpec::theme_key(KEY_HELP_KEY_FG)),
+                bold: true,
+                ..Default::default()
+            },
+            properties: Default::default(),
+        });
+    }
+
+    let disclosure_range = if node.has_children {
+        Some((disc_start, disc_end))
+    } else {
+        None
+    };
+    let entry = TextPropertyEntry {
+        text,
+        // The plugin's own row-level properties (e.g. file-row
+        // metadata) carry through unchanged so existing
+        // mouse_click handlers still see them.
+        properties: node.text.properties.clone(),
+        style: node.text.style.clone(),
+        inline_overlays: overlays,
+    };
+    RenderedTreeRow {
+        entry,
+        disclosure_range,
     }
 }
 
@@ -1977,5 +2280,318 @@ mod tests {
         assert_eq!(entries.len(), 4);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].buffer_row, 3);
+    }
+
+    // -------------------------------------------------------------
+    // Tree
+    // -------------------------------------------------------------
+
+    fn tnode(text: &str, depth: u32, has_children: bool) -> TreeNode {
+        TreeNode {
+            text: TextPropertyEntry::text(text),
+            depth,
+            has_children,
+        }
+    }
+
+    fn make_tree(
+        nodes: Vec<TreeNode>,
+        item_keys: Vec<&str>,
+        selected: i32,
+        visible: u32,
+        expanded: Vec<&str>,
+        key: Option<&str>,
+    ) -> WidgetSpec {
+        WidgetSpec::Tree {
+            nodes,
+            item_keys: item_keys.iter().map(|s| s.to_string()).collect(),
+            selected_index: selected,
+            visible_rows: visible,
+            expanded_keys: expanded.iter().map(|s| s.to_string()).collect(),
+            key: key.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn tree_row_renders_disclosure_glyph_for_internal_collapsed() {
+        let r = render_tree_row(&tnode("file.txt", 0, true), false);
+        assert!(r.entry.text.starts_with('\u{25B6}'), "starts with ▶");
+        assert!(r.entry.text.contains("file.txt"));
+        assert!(r.disclosure_range.is_some());
+    }
+
+    #[test]
+    fn tree_row_renders_disclosure_glyph_for_internal_expanded() {
+        let r = render_tree_row(&tnode("file.txt", 0, true), true);
+        assert!(r.entry.text.starts_with('\u{25BC}'), "starts with ▼");
+    }
+
+    #[test]
+    fn tree_row_leaf_uses_two_spaces_no_disclosure_hit() {
+        let r = render_tree_row(&tnode("match", 0, false), false);
+        // No glyph, just spaces for alignment.
+        assert!(r.entry.text.starts_with("  "));
+        assert!(r.entry.text.contains("match"));
+        assert!(r.disclosure_range.is_none());
+    }
+
+    #[test]
+    fn tree_row_indents_by_depth_times_two() {
+        let r = render_tree_row(&tnode("nested", 2, false), false);
+        // depth=2 → 4 leading spaces, then 2 alignment spaces, then "nested".
+        assert!(r.entry.text.starts_with("      nested"));
+    }
+
+    #[test]
+    fn tree_row_shifts_plugin_overlays_by_prefix() {
+        let mut node = tnode("hello", 1, false);
+        node.text.inline_overlays.push(InlineOverlay {
+            start: 0,
+            end: 5,
+            style: OverlayOptions {
+                bold: true,
+                ..Default::default()
+            },
+            properties: Default::default(),
+        });
+        let r = render_tree_row(&node, false);
+        // depth=1 → 2 indent + 2 alignment = 4 prefix bytes (ASCII).
+        // The plugin's [0..5] becomes [4..9].
+        let plugin_overlay = r
+            .entry
+            .inline_overlays
+            .iter()
+            .find(|o| o.style.bold)
+            .expect("bold overlay carried through");
+        assert_eq!(plugin_overlay.start, 4);
+        assert_eq!(plugin_overlay.end, 9);
+    }
+
+    #[test]
+    fn tree_renders_only_top_level_when_nothing_expanded() {
+        let spec = make_tree(
+            vec![
+                tnode("a", 0, true),
+                tnode("a.0", 1, false),
+                tnode("a.1", 1, false),
+                tnode("b", 0, true),
+                tnode("b.0", 1, false),
+            ],
+            vec!["a", "a.0", "a.1", "b", "b.0"],
+            -1,
+            10,
+            vec![], // none expanded
+            Some("T"),
+        );
+        let (entries, _hits, _state) = render_no_focus(&spec, &HashMap::new());
+        // Only the two top-level nodes are visible.
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].text.contains('a'));
+        assert!(entries[1].text.contains('b'));
+    }
+
+    #[test]
+    fn tree_renders_children_of_expanded_nodes() {
+        let spec = make_tree(
+            vec![
+                tnode("a", 0, true),
+                tnode("a.0", 1, false),
+                tnode("a.1", 1, false),
+                tnode("b", 0, true),
+                tnode("b.0", 1, false),
+            ],
+            vec!["a", "a.0", "a.1", "b", "b.0"],
+            -1,
+            10,
+            vec!["a"],
+            Some("T"),
+        );
+        let (entries, _hits, _state) = render_no_focus(&spec, &HashMap::new());
+        // a, a.0, a.1, b — b's child stays hidden.
+        assert_eq!(entries.len(), 4);
+    }
+
+    #[test]
+    fn tree_emits_two_hits_per_internal_row_one_per_leaf() {
+        // a (internal, expanded) + a.0 (leaf) → 2 hits for a (disclosure + body)
+        // and 1 hit for a.0 (body only).
+        let spec = make_tree(
+            vec![tnode("a", 0, true), tnode("a.0", 1, false)],
+            vec!["a", "a.0"],
+            -1,
+            10,
+            vec!["a"],
+            Some("T"),
+        );
+        let (_entries, hits, _state) = render_no_focus(&spec, &HashMap::new());
+        assert_eq!(hits.len(), 3);
+        // First hit: disclosure on the internal node.
+        assert_eq!(hits[0].event_type, "expand");
+        assert_eq!(hits[0].widget_kind, "tree");
+        assert_eq!(hits[1].event_type, "select");
+        assert_eq!(hits[2].event_type, "select");
+    }
+
+    #[test]
+    fn tree_hits_carry_tree_spec_key_and_per_item_key_in_payload() {
+        let spec = make_tree(
+            vec![tnode("only", 0, false)],
+            vec!["only-key"],
+            -1,
+            10,
+            vec![],
+            Some("matchTree"),
+        );
+        let (_entries, hits, _state) = render_no_focus(&spec, &HashMap::new());
+        assert_eq!(hits[0].widget_key, "matchTree");
+        assert_eq!(hits[0].payload["key"], "only-key");
+        assert_eq!(hits[0].payload["index"], 0);
+    }
+
+    #[test]
+    fn tree_persists_expanded_keys_in_instance_state() {
+        let spec = make_tree(
+            vec![tnode("a", 0, true), tnode("a.0", 1, false)],
+            vec!["a", "a.0"],
+            -1,
+            10,
+            vec!["a"],
+            Some("T"),
+        );
+        let (_, _, state) = render_no_focus(&spec, &HashMap::new());
+        match state.get("T").unwrap() {
+            WidgetInstanceState::Tree { expanded_keys, .. } => {
+                assert!(expanded_keys.contains("a"));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn tree_instance_state_overrides_spec_expanded_keys() {
+        // Previous instance state has b expanded but spec says a.
+        // Instance state wins (spec is initial-only after first render).
+        let mut prev = HashMap::new();
+        prev.insert(
+            "T".into(),
+            WidgetInstanceState::Tree {
+                scroll_offset: 0,
+                selected_index: -1,
+                expanded_keys: ["b".to_string()].iter().cloned().collect(),
+            },
+        );
+        let spec = make_tree(
+            vec![
+                tnode("a", 0, true),
+                tnode("a.0", 1, false),
+                tnode("b", 0, true),
+                tnode("b.0", 1, false),
+            ],
+            vec!["a", "a.0", "b", "b.0"],
+            -1,
+            10,
+            vec!["a"], // initial-only — ignored after first render
+            Some("T"),
+        );
+        let (entries, _hits, _state) = render_no_focus(&spec, &prev);
+        // Should render: a (collapsed), b, b.0 — three rows. a.0 hidden.
+        assert_eq!(entries.len(), 3);
+    }
+
+    #[test]
+    fn tree_selected_row_gets_focused_bg() {
+        let spec = make_tree(
+            vec![tnode("a", 0, false), tnode("b", 0, false)],
+            vec!["a", "b"],
+            1,
+            10,
+            vec![],
+            Some("T"),
+        );
+        let (entries, _hits, _state) = render_no_focus(&spec, &HashMap::new());
+        assert!(entries[0].style.is_none());
+        let style = entries[1].style.as_ref().expect("selected gets style");
+        assert_eq!(
+            style.bg.as_ref().and_then(|c| c.as_theme_key()),
+            Some("ui.menu_active_bg")
+        );
+        assert!(style.extend_to_line_end);
+    }
+
+    #[test]
+    fn tree_clamps_selection_to_visible_when_selected_node_is_hidden() {
+        // selected_index = 1 (a.0), but `a` is collapsed → a.0 hidden.
+        // The renderer falls back to the nearest earlier visible
+        // node (a, idx 0).
+        let spec = make_tree(
+            vec![tnode("a", 0, true), tnode("a.0", 1, false)],
+            vec!["a", "a.0"],
+            1,
+            10,
+            vec![], // a not expanded
+            Some("T"),
+        );
+        let (_entries, _hits, state) = render_no_focus(&spec, &HashMap::new());
+        match state.get("T").unwrap() {
+            WidgetInstanceState::Tree { selected_index, .. } => {
+                assert_eq!(*selected_index, 0);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn tree_scrolls_to_keep_selection_in_visible_window() {
+        // 6 visible rows total, visible_rows=3, selected at flat
+        // position 4 → scroll should be 2 (so selected lands at the
+        // bottom of the window).
+        let spec = make_tree(
+            vec![
+                tnode("0", 0, false),
+                tnode("1", 0, false),
+                tnode("2", 0, false),
+                tnode("3", 0, false),
+                tnode("4", 0, false),
+                tnode("5", 0, false),
+            ],
+            vec!["k0", "k1", "k2", "k3", "k4", "k5"],
+            4,
+            3,
+            vec![],
+            Some("T"),
+        );
+        let (entries, _hits, state) = render_no_focus(&spec, &HashMap::new());
+        // Visible window: items 2..5 → 3 rows.
+        assert_eq!(entries.len(), 3);
+        match state.get("T").unwrap() {
+            WidgetInstanceState::Tree { scroll_offset, .. } => assert_eq!(*scroll_offset, 2),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn tree_tabbable_keys_include_tree_with_key() {
+        let spec = WidgetSpec::Col {
+            children: vec![
+                WidgetSpec::Toggle {
+                    checked: false,
+                    label: "T".into(),
+                    focused: false,
+                    key: Some("toggle".into()),
+                },
+                make_tree(
+                    vec![tnode("a", 0, false)],
+                    vec!["a"],
+                    -1,
+                    10,
+                    vec![],
+                    Some("tree"),
+                ),
+            ],
+            key: None,
+        };
+        let mut tabbable = Vec::new();
+        collect_tabbable(&spec, &mut tabbable);
+        assert_eq!(tabbable, vec!["toggle", "tree"]);
     }
 }

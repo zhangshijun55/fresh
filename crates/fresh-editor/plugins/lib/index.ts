@@ -64,11 +64,14 @@ export {
   textInputChar,
   textInputKey,
   toggle,
+  tree,
+  treeNode,
   WidgetPanel,
 } from "./widgets.ts";
 export type {
   ButtonKind,
   HintEntry as WidgetHintEntry,
+  TreeNode,
   WidgetAction,
   WidgetMutation,
   WidgetSpec,

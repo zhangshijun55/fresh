@@ -135,6 +135,7 @@ fn get_type_decl(type_name: &str) -> Option<String> {
         "ButtonKind" => Some(fresh_core::api::ButtonKind::decl(&cfg)),
         "WidgetAction" => Some(fresh_core::api::WidgetAction::decl(&cfg)),
         "WidgetMutation" => Some(fresh_core::api::WidgetMutation::decl(&cfg)),
+        "TreeNode" => Some(fresh_core::api::TreeNode::decl(&cfg)),
 
         // Authority — payload schema for `editor.setAuthority(...)`.
         // Hand-written because the authoritative struct lives in
@@ -253,6 +254,7 @@ const DEPENDENCY_TYPES: &[&str] = &[
     // Widget library types (see docs/internal/plugin-widget-library-design.md)
     "HintEntry",      // Used by WidgetSpec::HintBar
     "ButtonKind",     // Used by WidgetSpec::Button.intent
+    "TreeNode",       // Used by WidgetSpec::Tree.nodes
     "WidgetSpec",     // Used by mountWidgetPanel/updateWidgetPanel
     "WidgetAction",   // Used by widgetCommand
     "WidgetMutation", // Used by widgetMutate

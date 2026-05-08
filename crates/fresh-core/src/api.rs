@@ -1156,6 +1156,46 @@ fn default_list_visible_rows() -> u32 {
     20
 }
 
+/// Default for `Tree::selected_index`. -1 ⇒ "no selection".
+fn default_tree_selected() -> i32 {
+    -1
+}
+
+/// Default visible-rows for a `Tree`. Same default as `List`.
+fn default_tree_visible_rows() -> u32 {
+    20
+}
+
+/// One node in a `Tree` widget's flat-list spec. The plugin walks
+/// its hierarchy depth-first and emits one `TreeNode` per node;
+/// `depth` controls indent, `has_children` controls whether the
+/// disclosure glyph (and its hit area) is rendered. The host filters
+/// the visible window — descendants of collapsed nodes are skipped.
+///
+/// `text` is the pre-rendered row content. The host prepends the
+/// indent + disclosure glyph at render time and shifts the entry's
+/// inline overlays accordingly; plugins emit `text` (and overlays)
+/// in the row's own coordinate space, starting at column 0.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct TreeNode {
+    /// The pre-rendered row content (text + per-row overlays).
+    /// The host renders this verbatim after the indent + disclosure
+    /// prefix; plugin overlays are byte-shifted by the prefix
+    /// length.
+    pub text: crate::text_property::TextPropertyEntry,
+    /// 0-based depth — controls leading indent (`depth * 2` spaces).
+    #[serde(default)]
+    pub depth: u32,
+    /// When true, render a disclosure glyph (`▶` collapsed / `▼`
+    /// expanded) and emit a hit area over it that fires the `expand`
+    /// event. Leaf nodes (`false`) get no glyph and no expand hit;
+    /// the row width occupies the full row.
+    #[serde(default)]
+    pub has_children: bool,
+}
+
 /// Visual role for a `Button`. Maps to theme keys at render time —
 /// plugins describe intent, not colors. See §7 of the design doc.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -1290,6 +1330,49 @@ pub enum WidgetSpec {
         /// host shows up to this many items per render.
         #[serde(default = "default_list_visible_rows")]
         visible_rows: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
+    },
+    /// Hierarchical list with host-managed expand/collapse, selection
+    /// styling, click routing, and virtual scrolling.
+    ///
+    /// The plugin emits its tree as a depth-first flat list of
+    /// `TreeNode`s (each carrying a `depth` and `has_children` flag)
+    /// plus a parallel `item_keys` array. The host filters out
+    /// descendants of collapsed nodes when rendering the visible
+    /// window, so the plugin always emits the *full* tree — toggling
+    /// expansion is host-owned (instance state) rather than the
+    /// plugin re-emitting on every `▶`/`▼` press.
+    ///
+    /// `expanded_keys` is initial-only (seeded into instance state
+    /// on first render); subsequent expansion changes flow through
+    /// `WidgetCommand::Key` (Right/Left) or click on the disclosure
+    /// glyph — neither requires the plugin to re-emit. Plugins that
+    /// need to react to expansion changes listen for
+    /// `widget_event { event_type: "expand" }`.
+    ///
+    /// `selected_index` is the *absolute* index into `nodes`
+    /// (initial-only; instance state takes over). Click on a row
+    /// fires `widget_event { event_type: "select", payload: { index,
+    /// key } }`; click on the disclosure column fires
+    /// `widget_event { event_type: "expand", payload: { index, key,
+    /// expanded } }`. Enter/Space on the focused tree fires
+    /// `widget_event { event_type: "activate", payload: { index, key } }`.
+    Tree {
+        nodes: Vec<TreeNode>,
+        #[serde(default)]
+        item_keys: Vec<String>,
+        #[serde(default = "default_tree_selected")]
+        selected_index: i32,
+        #[serde(default = "default_tree_visible_rows")]
+        visible_rows: u32,
+        /// Initial-only set of expanded item keys. Once the widget
+        /// has rendered, the host's instance-state `expanded_keys`
+        /// is authoritative; updating this field on subsequent specs
+        /// has no effect (use `WidgetMutation::SetExpandedKeys` to
+        /// override host state).
+        #[serde(default)]
+        expanded_keys: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         key: Option<String>,
     },
@@ -1464,6 +1547,15 @@ pub enum WidgetMutation {
         items: Vec<crate::text_property::TextPropertyEntry>,
         #[serde(default)]
         item_keys: Vec<String>,
+    },
+    /// Replace a `Tree`'s expanded-keys instance state. Plugins use
+    /// this when a non-user action needs to drive expansion (e.g.
+    /// "expand all", reveal-on-search). `Right`/`Left` arrow keys
+    /// and disclosure clicks already mutate expansion host-side
+    /// without the plugin's involvement.
+    SetExpandedKeys {
+        widget_key: String,
+        keys: Vec<String>,
     },
 }
 

@@ -287,7 +287,29 @@ impl Editor {
                     // waiting for the plugin to re-emit the spec.
                     self.rerender_widget_panel(panel_id);
                 }
-                if self.plugin_manager.has_hook_handlers("widget_event") {
+                // Tree disclosure click: the host owns expansion
+                // state, so toggle it before firing the plugin
+                // event (the toggle handler fires its own `expand`
+                // event with the post-toggle state). For tree
+                // row-body clicks (`event_type == "select"`) and
+                // all other widget kinds, fall through to the
+                // generic event dispatch. `hit.widget_key` is the
+                // tree's spec key (set by the renderer); the
+                // per-item key lives in `payload.key`.
+                let mut handled_specially = false;
+                if hit.widget_kind == "tree" && hit.event_type == "expand" {
+                    if let Some(item_key) =
+                        hit.payload.get("key").and_then(|v| v.as_str())
+                    {
+                        self.handle_widget_tree_expand_toggle(
+                            panel_id,
+                            &hit.widget_key,
+                            item_key,
+                        );
+                        handled_specially = true;
+                    }
+                }
+                if !handled_specially && self.plugin_manager.has_hook_handlers("widget_event") {
                     self.plugin_manager.run_hook(
                         "widget_event",
                         HookArgs::WidgetEvent {
