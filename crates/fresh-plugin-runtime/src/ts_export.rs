@@ -1233,6 +1233,7 @@ mod tests {
             "startPrompt",
             "startPromptWithInitial",
             "setPromptSuggestions",
+            "setPromptSelectedIndex",
             "setPromptInputSync",
             "defineMode",
             "setEditorMode",
