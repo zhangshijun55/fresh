@@ -1,5 +1,27 @@
 # Plan: streaming `git show` into a file-backed buffer
 
+## Executive summary
+
+| | Current state | Final design |
+|---|---|---|
+| **Pre-pass** | `git show --numstat` runs first (5.4 s on bun's rewrite commit) just to find files to exclude before the real fetch even starts | Removed. Oversized files are handled at render time via path heuristics + `--stat` line counts. |
+| **Transport** | `git show` stdout is captured into a 43 MB `String` in Rust, then crossed into QuickJS as one giant JS string. | `git show` stdout is piped **directly into a temp file** by the host. Bytes never enter the JS runtime. New optional 4th arg: `spawnProcess(cmd, args, cwd, { stdoutTo })`. |
+| **JS work per commit** | `output.split("\n")` (~1 M JS strings) → loop building ~1 M `TextPropertyEntry` objects → marshal across FFI as one `Vec<TextPropertyEntry>`. | None. Plugin spawns, opens the resulting file, ticks for growth, awaits exit code. ~30 LOC of JS. |
+| **Buffer storage** | Virtual buffer: `delete_bytes(0, 43M)` + `insert(0, &43_MB_string)` + bulk-add ~500 k `Overlay` objects to `marker_list`. | Real file-backed buffer (`BufferData::Unloaded`), 1 MB chunked load on scroll, bounded RSS. Diff coloring comes from the diff syntax grammar, not per-line overlays. |
+| **Time to first paint** | Blocks until git fully exits + entries are built + overlays placed. ~6.7 s for the rewrite commit. | Buffer opens immediately at 0 bytes; the file grows under it; first paint as soon as the first KB lands (< 100 ms). |
+| **Cancellation** | None. `pendingDetailId` only discards the *response*; the spawned `git show` keeps running for the full 5+ s after the user has moved on. Held `j` leaks a trail of zombie git processes. | `handle.kill()` on selection change. Requires adding the same `oneshot + tokio::select!` kill plumbing that `SpawnHostProcess` already has, to plugin `spawnProcess`. |
+| **Repeat visits** | Re-runs the full git pipeline every time. | Cache miss writes to `~/.cache/fresh/git-show/<sha>`; cache hit is just `openFile(path)`, no git at all (commits are immutable). LRU in-memory layer on top. |
+| **Long-line stalls** | 674 KB minified lines in lock files re-wrap every PageDown (~800 ms each). | Out of scope for this plan, but the file-backed buffer makes a renderer-side `nowrap` flag for diff views a tiny separate change. |
+| **Code shape** | Detail panel is a "virtual buffer" wired to a 1 M-entry array built in JS. Re-built from scratch on every selection. | Detail panel is a regular file-backed buffer. Plugin code shrinks; host gains two small primitives (`stdoutTo`, `refreshBufferFromDisk`). No architectural shift. |
+
+Three stackable PRs (~315 LOC of host changes, all mechanical, no
+core refactor):
+
+1. `spawnProcess` extensions: `stdoutTo` + kill plumbing.
+2. `refreshBufferFromDisk` + `openFile({ largeFile: true })` option.
+3. git-log plugin rewire: drop numstat, drop entry-array build, open
+   stream directly.
+
 ## Problem
 
 Opening the "Rewrite Bun in Rust" commit (`23427dbc` in bun) takes ~6.7 s and
