@@ -71,8 +71,8 @@ fn open_dialog_scopes_to_current_project_then_reveals_all() {
 
     run_palette(&mut harness, "Orchestrator: Open");
     harness
-        .wait_until(|h| h.screen_to_string().contains("this project"))
-        .expect("Orchestrator Open dialog should appear scoped to the current project");
+        .wait_until(|h| h.screen_to_string().contains("Project:"))
+        .expect("Orchestrator Open dialog should appear with the Project scope control");
 
     let screen = harness.screen_to_string();
     assert!(
@@ -81,19 +81,9 @@ fn open_dialog_scopes_to_current_project_then_reveals_all() {
         screen,
     );
     assert!(
-        screen.contains("this project"),
-        "Scoped section must be captioned as the current project.\nScreen:\n{}",
-        screen,
-    );
-    assert!(
-        screen.contains("in other projects"),
-        "Scoped view must advertise the cross-project sessions it isn't \
-         foregrounding so nothing feels hidden.\nScreen:\n{}",
-        screen,
-    );
-    assert!(
-        screen.contains("This project"),
-        "Scoped view must render the visible scope-toggle control.\nScreen:\n{}",
+        screen.contains("Project:") && screen.contains("(Alt+P)"),
+        "Scoped view must render the visible Project scope control with its \
+         Alt+P hint.\nScreen:\n{}",
         screen,
     );
 
@@ -108,18 +98,13 @@ fn open_dialog_scopes_to_current_project_then_reveals_all() {
 
     let screen = harness.screen_to_string();
     assert!(
-        screen.contains("Sessions (2)"),
-        "All-projects view must count every session.\nScreen:\n{}",
+        screen.contains("All ▾"),
+        "All-projects view must flip the Project control to 'All'.\nScreen:\n{}",
         screen,
     );
     assert!(
         screen.contains(LABEL_B),
         "Project B's session must still be listed in the all-projects view.\nScreen:\n{}",
-        screen,
-    );
-    assert!(
-        screen.contains("All projects"),
-        "All-projects view must show the scope-toggle in its 'all' state.\nScreen:\n{}",
         screen,
     );
 }

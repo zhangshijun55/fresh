@@ -363,18 +363,6 @@ function projectLabel(key: string): string {
   return base || key;
 }
 
-// Count sessions that do NOT belong to the current project —
-// surfaced as the "N in other projects" affordance when the
-// dialog is scoped to the current project.
-function otherProjectSessionCount(): number {
-  const cur = currentProjectKey();
-  let n = 0;
-  for (const s of orchestratorSessions.values()) {
-    if (projectKeyOf(s) !== cur) n += 1;
-  }
-  return n;
-}
-
 // Resolve the id list for the current filter + scope.
 //
 // Scope only constrains the *empty-filter* view: with no needle
@@ -433,11 +421,33 @@ function filterSessions(needle: string): number[] {
   return matches.map((m) => m.id);
 }
 
-// Build one rendered list-item row for `id`. Style cues:
-//   * `[id]` in `ui.help_key_fg`
-//   * `ACT` (active session) in `ui.tab_active_fg` + bold
-//   * other states use the default fg
-//   * label in default fg
+// Column widths for the tabular session list. ID holds `[NN] `;
+// NAME holds the label plus the BASE / ⇄ badges; PROJECT (filled
+// only for cross-project rows) trails. Kept in sync with
+// `sessionsColumnHeader`.
+const LIST_ID_W = 5;
+const LIST_NAME_W = 20;
+
+// Header row above the session list: `ID   NAME …   PROJECT`.
+function sessionsColumnHeader(): WidgetSpec {
+  return {
+    kind: "raw",
+    entries: [
+      styledRow([
+        {
+          text: "ID".padEnd(LIST_ID_W) + "NAME".padEnd(LIST_NAME_W) + "PROJECT",
+          style: { fg: "ui.menu_disabled_fg" },
+        },
+      ]),
+    ],
+  };
+}
+
+// Build one rendered list-item row for `id`, laid out in columns:
+//   `[id]`  <name + BASE/⇄ badges>   <project basename>
+// The active session's id renders in the active-tab colour (the
+// list has no separate state column); the project column is filled
+// only for sessions that don't belong to the current project.
 function renderListItem(id: number, activeId: number): TextPropertyEntry {
   const s = orchestratorSessions.get(id);
   if (!s) {
@@ -445,47 +455,37 @@ function renderListItem(id: number, activeId: number): TextPropertyEntry {
   }
   const isActive = id === activeId;
   const isBase = id === 1;
-  const stateText = isActive ? "ACT " : STATE_GLYPH[s.state];
+
+  const idText = `[${id}]`.padEnd(LIST_ID_W);
   const entries: { text: string; style?: Record<string, unknown> }[] = [
-    { text: `[${id}] `, style: { fg: "ui.help_key_fg" } },
     {
-      text: stateText,
+      text: idText,
       style: isActive
         ? { fg: "ui.tab_active_fg", bold: true }
-        : { fg: "ui.menu_disabled_fg" },
+        : { fg: "ui.help_key_fg" },
     },
-    { text: `  ${s.label}` },
+    { text: s.label, style: isActive ? { bold: true } : undefined },
   ];
-  // BASE badge: the base session is the editor process itself —
-  // archive / delete would close the editor (and possibly destroy
-  // the user's current worktree), so the host refuses both. The
-  // badge makes that special status visible up-front instead of
-  // surfacing as "Archive disabled, why?" after a Tab.
+  // Visible width of the NAME column so far (label + badges), used
+  // to pad out to LIST_NAME_W before the PROJECT column.
+  let nameWidth = s.label.length;
   if (isBase) {
-    entries.push({
-      text: " BASE",
-      style: { fg: "ui.help_key_fg", bold: true },
-    });
+    entries.push({ text: " BASE", style: { fg: "ui.help_key_fg", bold: true } });
+    nameWidth += 5;
   }
-  // SHARED badge for the row when this session shares its
-  // worktree (with another session or with the project root
-  // directly). Mirrors the preview pane's badge so the
-  // shared-worktree status is visible at-a-glance from the
-  // list too.
   if (s.sharedWorktree || countSiblingsAtRoot(s.root) > 1) {
-    entries.push({
-      text: " ⇄",
-      style: { fg: "ui.menu_disabled_fg" },
-    });
+    entries.push({ text: " ⇄", style: { fg: "ui.menu_disabled_fg" } });
+    nameWidth += 2;
   }
-  // Project tag: in the "all projects" view, label every row with
-  // its project so a cross-project session is obvious at a glance
-  // rather than blending into the current project's sessions. Use
-  // the project's basename (not the full parent/base label) so it
-  // fits the sessions column without truncating.
-  if (openDialog?.scope === "all" && projectKeyOf(s) !== currentProjectKey()) {
+  // PROJECT column: basename for cross-project rows only; current-
+  // project rows leave it blank (the whole list is one project when
+  // scoped, so this column is empty then).
+  const proj = projectKeyOf(s);
+  if (proj !== currentProjectKey()) {
+    const pad = Math.max(1, LIST_NAME_W - nameWidth);
+    entries.push({ text: " ".repeat(pad) });
     entries.push({
-      text: `  · ${editor.pathBasename(projectKeyOf(s))}`,
+      text: editor.pathBasename(proj),
       style: { fg: "ui.menu_disabled_fg", italic: true },
     });
   }
@@ -589,20 +589,34 @@ function sessionsSeparator(): WidgetSpec {
   return spacer(0);
 }
 
-// Approximate number of session rows the picker's list pane
-// should show. Sized off the full terminal (not the active
-// buffer's viewport — that shrinks with vertical splits and made
-// the picker collapse to ~half its `heightPct: 90` budget).
-function openListVisibleRows(): number {
+// Smallest list height we'll show even when there are only a
+// couple of sessions — keeps the preview pane (which matches the
+// list height) usable rather than collapsing to a sliver.
+const MIN_LIST_ROWS = 6;
+
+// Upper bound on session rows for this terminal — the list height
+// when the panel is at its full `heightPct: 90` budget. Sized off
+// the full terminal (not the active buffer's viewport — that
+// shrinks with vertical splits and made the picker collapse to
+// ~half its budget).
+function maxListRowsForScreen(): number {
   const screen = editor.getScreenSize();
   const h = screen.height > 0 ? screen.height : 30;
   const panelH = Math.floor(h * 0.9);
-  // panel borders (2) + header (1) + spacer (1) + sessions
-  // section borders (2) + filter row (1) + separator (1) +
-  // new-session button row (1) + separator (1) + footer (1) =
-  // 11 rows of chrome. Floor at 4 so a tiny terminal still
-  // shows something.
-  return Math.max(4, panelH - 11);
+  // Chrome that isn't list rows: panel borders (2) + title (1) +
+  // spacer (1) + footer (1) + sessions-section borders (2) +
+  // column chrome above the list (New + Project + Filter +
+  // separator + header = 5) = 12. Floor at MIN_LIST_ROWS so a tiny
+  // terminal still shows something.
+  return Math.max(MIN_LIST_ROWS, panelH - 12);
+}
+
+// Actual list height: fit the session count, clamped between
+// MIN_LIST_ROWS and the screen budget, so a handful of sessions
+// gives a compact panel (the host shrinks the floating panel to
+// content height) instead of a tall box padded with blank rows.
+function fitListRows(itemCount: number): number {
+  return Math.min(maxListRowsForScreen(), Math.max(MIN_LIST_ROWS, itemCount));
 }
 
 // Compose the right-hand preview pane. Normally it shows info
@@ -763,14 +777,14 @@ function buildPreviewPane(s: AgentSession | undefined): WidgetSpec {
     }
   }
   // Match the sessions column's content height so the two panes'
-  // bottom borders land on the same row. Sessions column inside
-  // its borders = filter (1) + separator (1) + new-session button
-  // (1) + separator (1) + list (listVisibleRows) = listVisibleRows
-  // + 4. Preview inside its borders = button row (1) + spacer (1)
-  // + embedRows, so embedRows must equal listVisibleRows + 2.
-  // When details ARE shown, two info rows + a spacer eat three
-  // more lines — `_DETAILS_CHROME_ROWS` accounts for that.
-  const totalEmbedBase = (openDialog?.listVisibleRows ?? 6) + 2;
+  // bottom borders land on the same row. Sessions column inside its
+  // borders = New (1) + Project (1) + Filter (1) + separator (1) +
+  // header (1) + list (listVisibleRows) = listVisibleRows + 5.
+  // Preview inside its borders = button row (1) + spacer (1) +
+  // embedRows, so embedRows must equal listVisibleRows + 3. When
+  // details ARE shown, two info rows + a spacer eat three more
+  // lines — `_DETAILS_CHROME_ROWS` accounts for that.
+  const totalEmbedBase = (openDialog?.listVisibleRows ?? MIN_LIST_ROWS) + 3;
   const detailsOn = openDialog?.showDetails ?? false;
   const _DETAILS_CHROME_ROWS = 3; // 2 info rows + 1 spacer
   const embedRows = Math.max(
@@ -868,24 +882,11 @@ function buildPreviewPane(s: AgentSession | undefined): WidgetSpec {
 
 function buildOpenSpec(): WidgetSpec {
   if (!openDialog) return col();
-  // Re-derive row counts on every spec build as a fallback for the
-  // resize hook not always firing reliably through tmux's SIGWINCH
-  // propagation (Finding I). **One-way ratchet**: only adopt the
-  // new value when it's *larger* than the current one. The
-  // `editor.getViewport()` height shrinks while the picker is
-  // mounted (the floating panel covers part of the buffer area),
-  // and naively re-reading it on every refresh fed that shrink
-  // back into the dialog size — pressing Up/Down caused the
-  // picker to oscillate smaller on every keystroke. A real
-  // terminal-grow event still flows through because the new
-  // viewport height exceeds the cached value; a spurious shrink
-  // (because the panel itself is up) is ignored.
-  const liveListVisibleRows = openListVisibleRows();
-  if (liveListVisibleRows > openDialog.listVisibleRows) {
-    openDialog.listVisibleRows = liveListVisibleRows;
-    openDialog.embedRows = Math.max(3, liveListVisibleRows - 5);
-  }
   const filtered = openDialog.filteredIds;
+  // Fit the list (and therefore the whole floating panel) to the
+  // session count, bounded by the screen budget — few sessions give
+  // a compact panel instead of a tall box padded with blank rows.
+  openDialog.listVisibleRows = fitListRows(filtered.length);
   const activeId = editor.activeWindow();
   const items = filtered.map((id) => renderListItem(id, activeId));
   const itemKeys = filtered.map(String);
@@ -913,9 +914,7 @@ function buildOpenSpec(): WidgetSpec {
     "orchestrator_open_new_from_picker",
     OPEN_MODE,
   );
-  const newLabel = newKey
-    ? `+ New Session  ${newKey}`
-    : "+ New Session";
+  const newLabel = newKey ? `+ New  ${newKey}` : "+ New";
   const inConfirm = openDialog.pendingConfirm !== null;
   // While a confirmation prompt is up the filter is rendered
   // without a `key`. The host's `collect_tabbable` only adds
@@ -928,7 +927,8 @@ function buildOpenSpec(): WidgetSpec {
   const filterInput = text({
     value: openDialog.filter.value,
     cursorByte: openDialog.filter.cursor,
-    placeholder: "type to filter…",
+    label: "Filter",
+    placeholder: "type to search… ( / )",
     fullWidth: true,
     key: inConfirm ? undefined : "filter",
   });
@@ -950,45 +950,33 @@ function buildOpenSpec(): WidgetSpec {
       }
     : null;
 
-  // Scope chrome. The title and the sessions-section label both
-  // advertise what the list is currently showing so the user is
-  // never confused about which project's sessions they're looking
-  // at. When scoped to the current project, a trailing affordance
-  // row reports how many sessions live elsewhere and how to reveal
-  // them — nothing is hidden, just not foregrounded.
+  // Scope chrome. The title keeps the active project visible; the
+  // `Project:` control below is the clickable scope switch.
   const scope = openDialog.scope;
   const curKey = currentProjectKey();
   const curName = projectLabel(curKey);
   const scopeKey = editor.getKeybindingLabel("orchestrator_toggle_scope", OPEN_MODE);
   const titleSuffix = scope === "current" ? `  —  ${curName}` : "  —  all projects";
-  const sectionLabel = scope === "current"
-    ? `${curName} · this project (${filtered.length})`
-    : `Sessions (${filtered.length})`;
-  // Visible, clickable scope toggle. The chevrons mark it as a
-  // cycle; clicking (or Alt+P) flips between this-project and
-  // all-projects. Inert while a confirm prompt is up (drop the key)
-  // so it can't steal focus from Cancel/Confirm.
-  const scopeToggleLabel = scope === "current" ? "‹ This project ›" : "‹ All projects ›";
-  const scopeToggleButton = button(scopeToggleLabel, {
+  const sectionLabel = "Sessions";
+  // `Project:` control — a visible, clickable scope switch with the
+  // Alt+P hint baked into the button label. Shows the current
+  // project's name when scoped, "All" when showing every project.
+  // Inert while a confirm prompt is up so it can't steal focus.
+  const scopeWord = scope === "current" ? editor.pathBasename(curKey) : "All";
+  const scopeButtonLabel = scopeKey ? `${scopeWord} ▾   (${scopeKey})` : `${scopeWord} ▾`;
+  const scopeButton = button(scopeButtonLabel, {
     key: openDialog.pendingConfirm !== null ? undefined : "scope-toggle",
   });
-  const otherCount = otherProjectSessionCount();
-  const otherAffordance: WidgetSpec[] = scope === "current" && otherCount > 0
-    ? [
-        sessionsSeparator(),
-        {
-          kind: "raw",
-          entries: [
-            styledRow([
-              {
-                text: `${otherCount} in other projects${scopeKey ? `  ·  ${scopeKey}` : ""}`,
-                style: { fg: "ui.menu_disabled_fg", italic: true },
-              },
-            ]),
-          ],
-        },
-      ]
-    : [];
+  const projectControlRow = row(
+    {
+      kind: "raw",
+      entries: [
+        styledRow([{ text: "Project: ", style: { fg: "ui.menu_disabled_fg" } }]),
+      ],
+    },
+    scopeButton,
+    flexSpacer(),
+  );
 
   return col(
     {
@@ -1022,12 +1010,12 @@ function buildOpenSpec(): WidgetSpec {
         // labels render without truncating to `· tmp_o…`. The preview
         // pane still keeps the majority for the live window embed.
         widthPct: 34,
-        // Sessions column: new-session button, separator, filter,
-        // scope toggle, separator, list. The button is first so it
-        // gets initial focus (Enter immediately opens the new
-        // session form). Separators are long `─` strings that
-        // the renderer truncates to the column's inner width —
-        // no need to measure cells from the plugin side.
+        // Sessions column: New button, Project (scope) control,
+        // Filter, separator, column header, list. The button is
+        // first so it gets initial focus (Enter immediately opens the
+        // new session form). Separators are long `─` strings that the
+        // renderer truncates to the column's inner width — no need to
+        // measure cells from the plugin side.
         child: col(
           row(
             button(newLabel, {
@@ -1042,30 +1030,20 @@ function buildOpenSpec(): WidgetSpec {
             }),
             flexSpacer(),
           ),
-          sessionsSeparator(),
+          projectControlRow,
           filterInput,
-          // Scope toggle: a visible, clickable control for the
-          // current-project ↔ all-projects switch (Alt+P also flips
-          // it). The chevrons hint it cycles; the footer + the "N in
-          // other projects" affordance spell out the alternative.
-          row(scopeToggleButton, flexSpacer()),
           sessionsSeparator(),
+          sessionsColumnHeader(),
           list({
             items,
             itemKeys,
             selectedIndex: selIdx,
-            // The scope-toggle row (always present) and the "N in
-            // other projects" affordance (separator + line, scoped
-            // view only) sit outside the list but inside the sessions
-            // column, eating into its height budget. Shrink the list's
-            // reserved rows by exactly those rows so the sessions
-            // column keeps the same total height as the preview pane —
-            // otherwise the extra rows push the footer hint bar off the
-            // bottom of the fixed-height panel.
-            visibleRows: Math.max(
-              1,
-              openDialog.listVisibleRows - 1 - otherAffordance.length,
-            ),
+            // `listVisibleRows` is the fitted list height; the 5 rows
+            // of column chrome above it (New / Project / Filter /
+            // separator / header) and the matching preview embed are
+            // accounted for separately so both panes stay the same
+            // height and the footer hint stays on-screen.
+            visibleRows: openDialog.listVisibleRows,
             // Excluded from the Tab cycle — Up/Down on the
             // filter input forwards to this list via host
             // smart-keys, so Tab jumps straight to the action
@@ -1081,12 +1059,10 @@ function buildOpenSpec(): WidgetSpec {
             // `pendingConfirm.sessionId`).
             key: inConfirm ? undefined : "sessions",
           }),
-          ...otherAffordance,
         ),
       }),
       // Preview pane has no explicit width — picks up the
-      // remaining 75% by default since the sessions list took
-      // 25%.
+      // remaining width by default since the sessions list took 34%.
       buildPreviewPane(selectedSession),
     ),
     row(
@@ -1177,7 +1153,9 @@ function openControlRoom(): void {
   if (openPanel) return;
   reconcileSessions();
   const activeId = editor.activeWindow();
-  const listVisibleRows = openListVisibleRows();
+  // Seed with the screen-max; buildOpenSpec refits to the session
+  // count on the first render (and every render after).
+  const listVisibleRows = maxListRowsForScreen();
   openDialog = {
     filter: { value: "", cursor: 0 },
     filteredIds: [],
@@ -1185,23 +1163,14 @@ function openControlRoom(): void {
     originalActiveSession: activeId,
     pendingConfirm: null,
     listVisibleRows,
-    // Mirror buildPreviewPane's chrome: 1 button row + 1 spacer
-    // + 2 info rows + 1 spacer = 4 rows reserved above the embed.
-    // Preview chrome above the embed: 1 button row + 1 spacer + 2
-    // info rows + 1 spacer = 5 rows. The labeledSection's top/bottom
-    // borders match the sessions list's, so subtracting just the
-    // chrome makes the preview pane's apparent height match the
-    // list pane's (`visible_rows + 2 borders`) exactly. Floored at
-    // 3 so a tiny terminal still leaves enough rows for the embed
-    // to paint something meaningful.
-    embedRows: Math.max(3, listVisibleRows - 5),
+    embedRows: Math.max(3, listVisibleRows + 3),
     showDetails: false,
     inFlight: null,
     lastError: null,
     // Default to the current project's sessions so re-opening the
     // editor in project B doesn't dump project A's whole history on
     // the user. Cross-project sessions stay one keystroke away via
-    // the scope toggle / the "N in other projects" affordance.
+    // the Project scope control / Alt+P.
     scope: "current",
   };
   openDialog.filteredIds = filterSessions("");
@@ -1772,6 +1741,12 @@ editor.defineMode(
     // and "all projects". Registered as a mode chord so it's
     // user-rebindable and renders cross-platform (⌥P / Alt+P).
     ["M-p", "orchestrator_toggle_scope"],
+    // `/` jumps focus to the filter input — the familiar
+    // search-focus shortcut. (As a mode chord it's intercepted even
+    // while the filter has focus, so `/` can't be typed as filter
+    // text; session names don't contain `/`, so that's an
+    // acceptable trade for the quick-focus.)
+    ["/", "orchestrator_focus_filter"],
   ],
   true,
   true,
@@ -1781,6 +1756,11 @@ registerHandler("orchestrator_open_new_from_picker", () => {
   if (!openDialog) return;
   closeOpenDialog();
   openForm({ fromPicker: true });
+});
+
+registerHandler("orchestrator_focus_filter", () => {
+  if (!openDialog || !openPanel) return;
+  openPanel.setFocusKey("filter");
 });
 
 function toggleScope(): void {
@@ -3498,9 +3478,8 @@ editor.on("active_window_changed", () => {
 // viewport at the same time.
 editor.on("resize", () => {
   if (openDialog && openPanel) {
-    const listVisibleRows = openListVisibleRows();
-    openDialog.listVisibleRows = listVisibleRows;
-    openDialog.embedRows = Math.max(3, listVisibleRows - 5);
+    // buildOpenSpec refits `listVisibleRows` to the session count
+    // (bounded by the new screen budget) on the refresh below.
     refreshOpenDialog();
   }
 });
