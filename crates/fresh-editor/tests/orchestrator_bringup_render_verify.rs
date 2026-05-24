@@ -15,13 +15,73 @@
 
 mod common;
 
-use common::harness::EditorTestHarness;
+use common::harness::{EditorTestHarness, HarnessOptions};
 use fresh::config::Config;
 use fresh::config_io::DirectoryContext;
+use fresh_core::WindowId;
 use std::path::{Path, PathBuf};
 
 fn json_path(p: &Path) -> String {
     serde_json::to_string(p).unwrap().trim_matches('"').to_string()
+}
+
+/// Build a harness in `project` with the worktree-hijack fixture
+/// planted, run phase-C restore. Returns (harness, project, worktree).
+fn hijack_harness() -> (EditorTestHarness, PathBuf, PathBuf, tempfile::TempDir) {
+    fresh::i18n::set_locale("en");
+    let sandbox = tempfile::tempdir().unwrap();
+    let mk = |n: &str| {
+        let p = sandbox.path().join(n);
+        std::fs::create_dir_all(&p).unwrap();
+        p.canonicalize().unwrap()
+    };
+    let data_home = mk("data-home");
+    let project = mk("project");
+    let worktree = mk("worktree");
+    std::fs::write(project.join("PROJECT_FILE.md"), "p").unwrap();
+    std::fs::write(worktree.join("WORKTREE_FILE.md"), "w").unwrap();
+
+    let dir_context = DirectoryContext::for_testing(&data_home);
+    let orch = dir_context.data_dir.join("orchestrator");
+    std::fs::create_dir_all(&orch).unwrap();
+    let fixture = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/orchestrator_bringup/v2_worktree_session.json"
+    ))
+    .unwrap()
+    .replace("__PROJECT__", &json_path(&project))
+    .replace("__WORKTREE__", &json_path(&worktree));
+    std::fs::write(orch.join("windows.json"), fixture).unwrap();
+
+    let config = Config {
+        check_for_updates: false,
+        ..Config::default()
+    };
+    let mut h = EditorTestHarness::create(
+        100,
+        40,
+        HarnessOptions::new()
+            .with_working_dir(project.clone())
+            .with_shared_dir_context(dir_context)
+            .with_config(config)
+            .with_empty_plugins_dir(),
+    )
+    .unwrap();
+    h.startup(true, &[]).unwrap();
+    h.editor_mut().restore_inactive_window_workspaces();
+    (h, project, worktree, sandbox)
+}
+
+fn pump_explorer_root(h: &mut EditorTestHarness) -> Option<PathBuf> {
+    h.editor_mut().show_file_explorer();
+    for _ in 0..50 {
+        h.render().unwrap();
+        h.editor_mut().process_async_messages();
+        if let Some(v) = h.editor().file_explorer() {
+            return Some(v.tree().root_path().to_path_buf());
+        }
+    }
+    None
 }
 
 #[test]
@@ -140,5 +200,68 @@ fn observe_rendered_root_under_worktree_hijack() {
         title_project.as_deref(),
         Some("project"),
         "window title's project name is the cwd, NOT the worktree"
+    );
+}
+
+/// Localizes the ACTUAL mechanism behind the screenshots.
+///
+/// At construction the active window pointer is set directly to the
+/// worktree session (id 2) WITHOUT syncing `working_dir` — hence the
+/// inconsistency the test above captured (active=worktree, working_dir
+/// =cwd). The moment anything routes through `set_active_window` (a
+/// window switch / dive), `working_dir` is set to that window's root,
+/// and the file explorer re-roots there. This is the step that turns
+/// the latent worktree-hijack into the visible "explorer shows a
+/// foreign dir" symptom.
+#[test]
+fn switching_through_set_active_window_reroots_working_dir_and_explorer() {
+    let (mut h, project, worktree, _sandbox) = hijack_harness();
+
+    // At launch the active window IS the worktree (id 2), yet working_dir
+    // is the cwd — construction set the active pointer directly without
+    // syncing working_dir. This is the latent inconsistency.
+    assert_eq!(h.editor().active_window().root, worktree);
+    assert_eq!(h.editor().working_dir(), project.as_path());
+
+    // Route through set_active_window (a window switch / dive). This is
+    // the code path that syncs working_dir to the active window's root.
+    h.editor_mut().set_active_window(WindowId(1));
+    assert_eq!(
+        h.editor().working_dir(),
+        project.as_path(),
+        "switching to the base window points working_dir at the project"
+    );
+
+    h.editor_mut().set_active_window(WindowId(2));
+    assert_eq!(
+        h.editor().working_dir(),
+        worktree.as_path(),
+        "switching to the worktree window points working_dir at the WORKTREE"
+    );
+
+    // The window title's project name follows working_dir live — so
+    // after the switch it shows the worktree (matches the screenshots'
+    // title).
+    let title_after = h
+        .editor()
+        .working_dir()
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(str::to_string);
+    assert_eq!(
+        title_after.as_deref(),
+        Some("worktree"),
+        "the title's project name becomes the worktree after the switch"
+    );
+
+    // The file explorer roots at working_dir AT FIRST-INIT TIME. Opening
+    // it now (first init, while on the worktree window) roots it at the
+    // worktree — the visible explorer symptom. (Note: the root is sticky;
+    // an explorer already initialized at the cwd would NOT re-root on a
+    // later switch — see the discovery in the test above.)
+    assert_eq!(
+        pump_explorer_root(&mut h),
+        Some(worktree.clone()),
+        "an explorer first opened while on the worktree window roots at the worktree"
     );
 }
